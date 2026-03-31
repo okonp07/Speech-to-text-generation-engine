@@ -40,6 +40,12 @@ To support Approach 2 (Production WebSocket), the following infrastructure and d
 *   **Task 4.2:** Optimize CPU/Memory usage to handle multiple concurrent WebSocket sessions.
 *   **Task 4.3:** Perform end-to-end stress testing and finalize the `weekly-log` documentation.
 
+### Week 5: UX Refinements & Global Integration
+*   **Task 5.1:** Integrate AI Denoise toggle for standard microphone and file upload modes.
+*   **Task 5.2:** Standardize sidebar and UI color contrast for accessibility.
+*   **Task 5.3:** Finalize transcript export (TXT, SRT, JSON, CSV) integration into the Streamlit Results view.
+*   **Task 5.4:** Fix WebSocket protocol and hostname detection for the real-time component.
+
 ---
 
 ## 3. Weekly Log Directory

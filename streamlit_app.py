@@ -54,6 +54,19 @@ def _inject_styles() -> None:
             padding-bottom: 3rem;
             max-width: 1180px;
         }
+        [data-testid="stSidebar"] {
+            background-color: #f7f3ea;
+        }
+        [data-testid="stSidebar"] label[data-testid="stWidgetLabel"] p,
+        [data-testid="stSidebar"] .stCaption,
+        [data-testid="stSidebar"] .stMarkdown p,
+        [data-testid="stSidebar"] .stMarkdown h3 {
+            color: #102a26 !important;
+        }
+        [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
+            color: #102a26 !important;
+            background: rgba(255, 252, 245, 0.9) !important;
+        }
         label[data-testid="stWidgetLabel"],
         label[data-testid="stWidgetLabel"] p,
         .stCaption,
@@ -792,15 +805,21 @@ def _transcript_html(result: "TranscriptionResult") -> str:
     )
 
 
-def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str | None):
+def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str | None, denoise: bool = False):
     suffix = Path(uploaded_file.name).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
         temp_file.write(uploaded_file.getbuffer())
         temp_path = Path(temp_file.name)
 
     try:
-        result = transcriber.transcribe_file(temp_path, language=language)
         audio = transcriber.processor.load_audio(temp_path)
+        
+        if denoise:
+            with st.spinner("Cleaning audio with AI..."):
+                audio = transcriber.processor.denoise(audio, sample_rate=transcriber.processor.sample_rate)
+        
+        # Transcribe from the array (which may be denoised)
+        result = transcriber.transcribe_array(audio, sample_rate=transcriber.processor.sample_rate, language=language)
         report = transcriber.processor.quality_report(audio)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -963,8 +982,9 @@ def _render_realtime_transcription() -> None:
             };
 
             startBtn.onclick = async () => {
-                // In a real deployment, replace with your actual WebSocket URL
-                const wsUrl = `ws://${window.location.hostname}:8000/ws/transcribe`;
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const host = window.location.hostname;
+                const wsUrl = `${protocol}//${host}:8000/ws/transcribe`;
                 socket = new WebSocket(wsUrl);
                 
                 socket.onopen = () => {
@@ -1080,8 +1100,10 @@ def _render_app_page() -> None:
         horizontal=True,
     )
 
+    denoise_enabled = st.checkbox("Apply AI Noise Reduction", value=True, help="Clean background noise before transcribing.")
+
     if input_method == "Real-time transcription":
-        _render_realtime_transcription()
+        _render_realtime_transcription() # This already has its own denoise toggle in HTML
         return
 
     audio_source = None
@@ -1091,7 +1113,6 @@ def _render_app_page() -> None:
         )
         audio_source = st.audio_input(
             "Record speech",
-            sample_rate=22050,
             key=f"audio-input-{st.session_state.audio_input_key}",
         )
     else:
@@ -1118,7 +1139,7 @@ def _render_app_page() -> None:
 
     try:
         transcriber = _load_transcriber(model_size)
-        audio, result, report = _transcribe(audio_source, transcriber, language=language)
+        audio, result, report = _transcribe(audio_source, transcriber, language=language, denoise=denoise_enabled)
     except RuntimeError as exc:
         st.error(str(exc))
         st.caption(
@@ -1151,6 +1172,40 @@ def _render_app_page() -> None:
             "N/A" if result.language_confidence is None else f"{result.language_confidence:.1%}",
         )
         st.metric("Transcript duration", f"{result.duration_seconds:.1f}s")
+        
+        # Task: Export Options
+        st.markdown("### Export Transcript")
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            st.download_button(
+                "Plain Text (.txt)",
+                data=result.to_txt(),
+                file_name=f"transcript_{audio_source.name}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+            st.download_button(
+                "Subtitles (.srt)",
+                data=result.to_srt(),
+                file_name=f"transcript_{audio_source.name}.srt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        with export_col2:
+            st.download_button(
+                "Data (.json)",
+                data=result.to_json(),
+                file_name=f"transcript_{audio_source.name}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+            st.download_button(
+                "Table (.csv)",
+                data=result.to_csv(),
+                file_name=f"transcript_{audio_source.name}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
     if result.segments:
         _section_intro(
