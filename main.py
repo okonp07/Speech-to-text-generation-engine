@@ -39,6 +39,7 @@ html = """
         <div class="controls">
             <button id="start">Start Recording</button>
             <button id="stop" disabled>Stop Recording</button>
+            <label><input type="checkbox" id="denoise" checked> Denoise Audio</label>
             <span id="status" class="status">Ready</span>
         </div>
         <div id="transcript"></div>
@@ -50,8 +51,15 @@ html = """
 
             const startBtn = document.getElementById('start');
             const stopBtn = document.getElementById('stop');
+            const denoiseCheckbox = document.getElementById('denoise');
             const transcriptDiv = document.getElementById('transcript');
             const statusSpan = document.getElementById('status');
+
+            denoiseCheckbox.onchange = () => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
+                }
+            };
 
             startBtn.onclick = async () => {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -60,12 +68,15 @@ html = """
                 socket.onopen = () => {
                     statusSpan.innerText = "Connected";
                     statusSpan.style.color = "green";
+                    // Send initial config
+                    socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
                 };
 
                 socket.onmessage = (event) => {
                     const data = JSON.parse(event.data);
                     if (data.type === "partial" || data.type === "final") {
-                        transcriptDiv.innerText += data.text + " ";
+                        const tag = data.denoised ? " [Denoised]" : "";
+                        transcriptDiv.innerText += data.text + tag + " ";
                     } else if (data.type === "error") {
                         console.error("Server Error:", data.message);
                     }
@@ -137,45 +148,61 @@ async def websocket_endpoint(websocket: WebSocket):
     # We'll use a lock to prevent concurrent transcription calls on the same session
     transcribe_lock = asyncio.Lock()
     
-    async def transcribe_chunk(audio_np):
+    async def transcribe_chunk(audio_np, denoise=True):
         if not transcriber:
             await websocket.send_json({"type": "error", "message": "Transcriber not initialized"})
             return
             
         async with transcribe_lock:
             try:
-                # transcribe_array expects a numpy array. 
-                # Whisper usually prefers 16kHz.
+                # Task 2.2: Apply noise reduction
+                processed_audio = audio_np
+                if denoise:
+                    processed_audio = await asyncio.to_thread(
+                        transcriber.processor.denoise, 
+                        audio_np, 
+                        sample_rate=16000
+                    )
+
+                # Transcribe
                 result = await asyncio.to_thread(
                     transcriber.transcribe_array, 
-                    audio_np, 
+                    processed_audio, 
                     sample_rate=16000
                 )
                 if result.text.strip() and result.text != "No speech detected.":
                     await websocket.send_json({
                         "type": "final", 
                         "text": result.text,
-                        "confidence": result.confidence
+                        "confidence": result.confidence,
+                        "denoised": denoise
                     })
             except Exception as e:
-                logger.error(f"Transcription error: {e}")
+                logger.error(f"Transcription/Denoise error: {e}")
                 await websocket.send_json({"type": "error", "message": str(e)})
+
+    use_denoise = True
 
     try:
         while True:
-            # Receive binary audio data (Float32 samples)
-            data = await websocket.receive_bytes()
-            chunk = np.frombuffer(data, dtype=np.float32)
-            audio_buffer.append(chunk)
+            # Receive data (could be bytes or text for configuration)
+            message = await websocket.receive()
             
-            # Task 1.3: Trigger transcription every ~3 seconds (at 16kHz, 48000 samples)
-            # 4096 samples per chunk * 12 chunks ~= 49152 samples
-            if len(audio_buffer) >= 12:
-                full_audio = np.concatenate(audio_buffer)
-                # Run transcription in a separate thread to avoid blocking the WS loop
-                asyncio.create_task(transcribe_chunk(full_audio))
-                # Clear buffer (simple approach, Task 4.1 will improve this with sliding window)
-                audio_buffer = []
+            if "bytes" in message:
+                data = message["bytes"]
+                chunk = np.frombuffer(data, dtype=np.float32)
+                audio_buffer.append(chunk)
+                
+                if len(audio_buffer) >= 12:
+                    full_audio = np.concatenate(audio_buffer)
+                    asyncio.create_task(transcribe_chunk(full_audio, denoise=use_denoise))
+                    audio_buffer = []
+            elif "text" in message:
+                import json
+                config = json.loads(message["text"])
+                if "denoise" in config:
+                    use_denoise = config["denoise"]
+                    logger.info(f"Denoising set to: {use_denoise}")
                 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")

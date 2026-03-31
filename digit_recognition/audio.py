@@ -57,6 +57,41 @@ class AudioProcessor:
         self.n_mels = n_mels
         self.n_fft = n_fft
         self.hop_length = hop_length
+        self._df_model = None
+
+    def _load_df_model(self):
+        if self._df_model is not None:
+            return self._df_model
+        try:
+            from df.enhance import init_df
+            self._df_model = init_df()
+        except ImportError:
+            # Fallback if deepfilternet is not available
+            return None
+        return self._df_model
+
+    def denoise(self, audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
+        """Apply DeepFilterNet noise reduction."""
+        model = self._load_df_model()
+        if model is None:
+            return audio
+            
+        try:
+            from df.enhance import enhance, load_audio, save_audio
+            # DeepFilterNet expects 48kHz internally but can handle 16kHz
+            # For simplicity in this Task 2.1, we wrap the array in the required format
+            import torch
+            
+            # Convert to torch tensor
+            audio_torch = torch.from_numpy(audio).unsqueeze(0) # [1, samples]
+            
+            # Enhance
+            enhanced = enhance(model, model[0], audio_torch, sample_rate=sample_rate)
+            
+            # Convert back to numpy
+            return enhanced.squeeze(0).numpy()
+        except Exception:
+            return audio
 
     def load_audio(self, path: str | Path) -> np.ndarray:
         librosa = _require_librosa()
