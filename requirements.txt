@@ -7,3 +7,7 @@ streamlit>=1.32
 pandas>=2.1
 soundfile>=0.12
 faster-whisper>=1.1
+fastapi>=0.100.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+websockets>=11.0
