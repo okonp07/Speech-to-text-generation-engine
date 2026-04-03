@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import tempfile
+import wave
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -833,6 +835,61 @@ def _transcript_html(result: "TranscriptionResult") -> str:
     )
 
 
+def _load_uploaded_audio_bytes(uploaded_file, sample_rate: int) -> np.ndarray:
+    raw_bytes = uploaded_file.getvalue()
+
+    try:
+        import soundfile as sf
+
+        audio, file_sample_rate = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=False)
+        audio_array = np.asarray(audio, dtype=np.float32)
+        if audio_array.ndim > 1:
+            audio_array = np.mean(audio_array, axis=1)
+        if file_sample_rate != sample_rate:
+            duration = len(audio_array) / float(file_sample_rate)
+            target_length = max(int(round(duration * sample_rate)), 1)
+            original_positions = np.linspace(0.0, duration, num=len(audio_array), endpoint=False)
+            target_positions = np.linspace(0.0, duration, num=target_length, endpoint=False)
+            audio_array = np.interp(target_positions, original_positions, audio_array).astype(np.float32, copy=False)
+        return audio_array.astype(np.float32, copy=False)
+    except Exception:
+        suffix = Path(uploaded_file.name).suffix.lower()
+        if suffix != ".wav":
+            raise RuntimeError(
+                "Audio decoding failed. Install soundfile-compatible dependencies or upload a WAV file."
+            )
+
+    with wave.open(io.BytesIO(raw_bytes), "rb") as wav_file:
+        file_sample_rate = wav_file.getframerate()
+        sample_width = wav_file.getsampwidth()
+        channels = wav_file.getnchannels()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
+    dtype = dtype_map.get(sample_width)
+    if dtype is None:
+        raise RuntimeError(f"Unsupported WAV sample width: {sample_width}")
+
+    audio_array = np.frombuffer(frames, dtype=dtype)
+    if channels > 1:
+        audio_array = audio_array.reshape(-1, channels).mean(axis=1)
+
+    if sample_width == 1:
+        audio_array = (audio_array.astype(np.float32) - 128.0) / 128.0
+    else:
+        max_value = float(np.iinfo(dtype).max)
+        audio_array = audio_array.astype(np.float32) / max_value
+
+    if file_sample_rate != sample_rate:
+        duration = len(audio_array) / float(file_sample_rate)
+        target_length = max(int(round(duration * sample_rate)), 1)
+        original_positions = np.linspace(0.0, duration, num=len(audio_array), endpoint=False)
+        target_positions = np.linspace(0.0, duration, num=target_length, endpoint=False)
+        audio_array = np.interp(target_positions, original_positions, audio_array).astype(np.float32, copy=False)
+
+    return audio_array.astype(np.float32, copy=False)
+
+
 def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str | None, denoise: bool = False):
     suffix = Path(uploaded_file.name).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -840,7 +897,7 @@ def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str |
         temp_path = Path(temp_file.name)
 
     try:
-        audio = transcriber.processor.load_audio(temp_path)
+        audio = _load_uploaded_audio_bytes(uploaded_file, transcriber.processor.sample_rate)
         
         if denoise:
             with st.spinner("Cleaning audio with AI..."):
