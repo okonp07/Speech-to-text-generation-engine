@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import csv
-import io
-import json
-import os
 import tempfile
-import wave
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -57,23 +53,6 @@ def _inject_styles() -> None:
             padding-top: 2rem;
             padding-bottom: 3rem;
             max-width: 1180px;
-        }
-        .stCheckbox label p {
-            color: #102a26 !important;
-            font-weight: 600 !important;
-        }
-        [data-testid="stSidebar"] {
-            background-color: #f7f3ea;
-        }
-        [data-testid="stSidebar"] label[data-testid="stWidgetLabel"] p,
-        [data-testid="stSidebar"] .stCaption,
-        [data-testid="stSidebar"] .stMarkdown p,
-        [data-testid="stSidebar"] .stMarkdown h3 {
-            color: #102a26 !important;
-        }
-        [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
-            color: #102a26 !important;
-            background: rgba(255, 252, 245, 0.9) !important;
         }
         label[data-testid="stWidgetLabel"],
         label[data-testid="stWidgetLabel"] p,
@@ -489,21 +468,6 @@ def _inject_styles() -> None:
     )
 
 
-def _get_realtime_ws_url_hint() -> str:
-    """Return an optional WebSocket URL override for real-time transcription."""
-    for key in ("REALTIME_WS_URL", "REALTIME_API_BASE_URL"):
-        value = os.getenv(key, "").strip()
-        if value:
-            if key == "REALTIME_API_BASE_URL":
-                if value.startswith("https://"):
-                    return f"wss://{value.removeprefix('https://').rstrip('/')}/ws/transcribe"
-                if value.startswith("http://"):
-                    return f"ws://{value.removeprefix('http://').rstrip('/')}/ws/transcribe"
-                return value.rstrip("/") + "/ws/transcribe"
-            return value
-    return ""
-
-
 def _render_hero(
     kicker: str = "Live Speech-to-Text",
     title: str = "Speech-to-Text Transcription",
@@ -581,6 +545,8 @@ def _render_footer() -> None:
 
 
 def _plot_audio(audio: np.ndarray, sample_rate: int):
+    import librosa
+
     figure, axes = plt.subplots(2, 1, figsize=(10, 6))
     times = np.arange(len(audio)) / sample_rate
     axes[0].plot(times, audio, color="#0f766e", linewidth=1)
@@ -588,22 +554,13 @@ def _plot_audio(audio: np.ndarray, sample_rate: int):
     axes[0].set_xlabel("Time (s)")
     axes[0].set_ylabel("Amplitude")
 
-    try:
-        import librosa
-
-        mel = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=64, n_fft=1024, hop_length=256)
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-        image = axes[1].imshow(mel_db, aspect="auto", origin="lower", cmap="magma")
-        axes[1].set_title("Mel Spectrogram")
-        axes[1].set_xlabel("Frame")
-        axes[1].set_ylabel("Mel Bin")
-        figure.colorbar(image, ax=axes[1], shrink=0.8)
-    except ImportError:
-        _, _, _, image = axes[1].specgram(audio, Fs=sample_rate, NFFT=1024, noverlap=768, cmap="magma")
-        axes[1].set_title("Spectrogram")
-        axes[1].set_xlabel("Time (s)")
-        axes[1].set_ylabel("Frequency (Hz)")
-        figure.colorbar(image, ax=axes[1], shrink=0.8)
+    mel = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=64, n_fft=1024, hop_length=256)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    image = axes[1].imshow(mel_db, aspect="auto", origin="lower", cmap="magma")
+    axes[1].set_title("Mel Spectrogram")
+    axes[1].set_xlabel("Frame")
+    axes[1].set_ylabel("Mel Bin")
+    figure.colorbar(image, ax=axes[1], shrink=0.8)
     figure.tight_layout()
     return figure
 
@@ -835,76 +792,15 @@ def _transcript_html(result: "TranscriptionResult") -> str:
     )
 
 
-def _load_uploaded_audio_bytes(uploaded_file, sample_rate: int) -> np.ndarray:
-    raw_bytes = uploaded_file.getvalue()
-
-    try:
-        import soundfile as sf
-
-        audio, file_sample_rate = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=False)
-        audio_array = np.asarray(audio, dtype=np.float32)
-        if audio_array.ndim > 1:
-            audio_array = np.mean(audio_array, axis=1)
-        if file_sample_rate != sample_rate:
-            duration = len(audio_array) / float(file_sample_rate)
-            target_length = max(int(round(duration * sample_rate)), 1)
-            original_positions = np.linspace(0.0, duration, num=len(audio_array), endpoint=False)
-            target_positions = np.linspace(0.0, duration, num=target_length, endpoint=False)
-            audio_array = np.interp(target_positions, original_positions, audio_array).astype(np.float32, copy=False)
-        return audio_array.astype(np.float32, copy=False)
-    except Exception:
-        suffix = Path(uploaded_file.name).suffix.lower()
-        if suffix != ".wav":
-            raise RuntimeError(
-                "Audio decoding failed. Install soundfile-compatible dependencies or upload a WAV file."
-            )
-
-    with wave.open(io.BytesIO(raw_bytes), "rb") as wav_file:
-        file_sample_rate = wav_file.getframerate()
-        sample_width = wav_file.getsampwidth()
-        channels = wav_file.getnchannels()
-        frames = wav_file.readframes(wav_file.getnframes())
-
-    dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
-    dtype = dtype_map.get(sample_width)
-    if dtype is None:
-        raise RuntimeError(f"Unsupported WAV sample width: {sample_width}")
-
-    audio_array = np.frombuffer(frames, dtype=dtype)
-    if channels > 1:
-        audio_array = audio_array.reshape(-1, channels).mean(axis=1)
-
-    if sample_width == 1:
-        audio_array = (audio_array.astype(np.float32) - 128.0) / 128.0
-    else:
-        max_value = float(np.iinfo(dtype).max)
-        audio_array = audio_array.astype(np.float32) / max_value
-
-    if file_sample_rate != sample_rate:
-        duration = len(audio_array) / float(file_sample_rate)
-        target_length = max(int(round(duration * sample_rate)), 1)
-        original_positions = np.linspace(0.0, duration, num=len(audio_array), endpoint=False)
-        target_positions = np.linspace(0.0, duration, num=target_length, endpoint=False)
-        audio_array = np.interp(target_positions, original_positions, audio_array).astype(np.float32, copy=False)
-
-    return audio_array.astype(np.float32, copy=False)
-
-
-def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str | None, denoise: bool = False):
+def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str | None):
     suffix = Path(uploaded_file.name).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
         temp_file.write(uploaded_file.getbuffer())
         temp_path = Path(temp_file.name)
 
     try:
-        audio = _load_uploaded_audio_bytes(uploaded_file, transcriber.processor.sample_rate)
-        
-        if denoise:
-            with st.spinner("Cleaning audio with AI..."):
-                audio = transcriber.processor.denoise(audio, sample_rate=transcriber.processor.sample_rate)
-        
-        # Transcribe from the array (which may be denoised)
-        result = transcriber.transcribe_array(audio, sample_rate=transcriber.processor.sample_rate, language=language)
+        result = transcriber.transcribe_file(temp_path, language=language)
+        audio = transcriber.processor.load_audio(temp_path)
         report = transcriber.processor.quality_report(audio)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -1025,258 +921,6 @@ def _render_about_page() -> None:
             st.image(AUTHOR_IMAGE, use_container_width=True)
 
 
-def _render_realtime_transcription() -> None:
-    _section_intro(
-        "Real-time Transcription",
-        "Speak naturally and watch the transcript appear in real-time. This mode uses a persistent WebSocket connection for low-latency processing.",
-        anchor_id="realtime-section",
-    )
-    ws_url_hint = json.dumps(_get_realtime_ws_url_hint())
-
-    # We use a custom HTML component to handle the WebSocket and Audio recording
-    # because Streamlit's native components are not optimized for low-latency streaming.
-    st.components.v1.html(
-        """
-        <div id="realtime-container" style="background: rgba(255, 252, 245, 0.88); border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 24px; padding: 1.25rem; box-shadow: 0 12px 34px rgba(15, 23, 42, 0.06); font-family: sans-serif;">
-            <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;">
-                <button id="start-rt" style="background: #0f766e; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 999px; cursor: pointer; font-weight: 600;">Start Live Recording</button>
-                <button id="stop-rt" disabled style="background: #e2e8f0; color: #64748b; border: none; padding: 0.6rem 1.2rem; border-radius: 999px; cursor: pointer; font-weight: 600;">Stop</button>
-                <label style="color: #4b5563; font-size: 0.9rem; display: flex; align-items: center; gap: 0.4rem;">
-                    <input type="checkbox" id="denoise-rt" checked> AI Denoise
-                </label>
-                <span id="status-rt" style="font-size: 0.85rem; color: #64748b;">Ready</span>
-            </div>
-            <div id="transcript-rt" style="color: #102a26; font-size: 1.05rem; line-height: 1.7; min-height: 150px; white-space: pre-wrap; background: white; padding: 1rem; border-radius: 16px; border: 1px solid #f1f5f9;"></div>
-        </div>
-
-        <script>
-            let socket;
-            let audioContext;
-            let processor;
-            let input;
-            let recognition;
-            let usingBrowserRecognition = false;
-            let browserTranscript = "";
-            let browserInterimTranscript = "";
-            let userStoppedRealtime = false;
-
-            const startBtn = document.getElementById('start-rt');
-            const stopBtn = document.getElementById('stop-rt');
-            const denoiseCheckbox = document.getElementById('denoise-rt');
-            const transcriptDiv = document.getElementById('transcript-rt');
-            const statusSpan = document.getElementById('status-rt');
-            const configuredWsUrl = __WS_URL_HINT__;
-
-            const getWebSocketUrl = () => {
-                if (configuredWsUrl) {
-                    return configuredWsUrl;
-                }
-
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const hostname = window.location.hostname;
-                const isLocalHost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(hostname);
-
-                if (isLocalHost) {
-                    return `${protocol}//${hostname}:8000/ws/transcribe`;
-                }
-
-                return `${protocol}//${window.location.host}/ws/transcribe`;
-            };
-
-            const renderBrowserTranscript = () => {
-                const finalText = browserTranscript.trim();
-                const interimText = browserInterimTranscript.trim();
-                transcriptDiv.innerText = [finalText, interimText].filter(Boolean).join(" ");
-                transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
-            };
-
-            const stopRealtimeCapture = () => {
-                if (processor) {
-                    processor.disconnect();
-                    processor = null;
-                }
-                if (input) {
-                    input.disconnect();
-                    if (input.mediaStream) {
-                        input.mediaStream.getTracks().forEach((track) => track.stop());
-                    }
-                    input = null;
-                }
-                if (audioContext && audioContext.state !== 'closed') {
-                    audioContext.close();
-                    audioContext = null;
-                }
-                if (recognition) {
-                    recognition.onend = null;
-                    recognition.stop();
-                    recognition = null;
-                }
-                if (socket) {
-                    socket.close();
-                    socket = null;
-                }
-            };
-
-            const startBrowserRecognition = () => {
-                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-                if (!SpeechRecognition) {
-                    statusSpan.innerText = "Realtime transcription unavailable in this browser";
-                    statusSpan.style.color = "#ef4444";
-                    return false;
-                }
-
-                usingBrowserRecognition = true;
-                browserTranscript = "";
-                browserInterimTranscript = "";
-                recognition = new SpeechRecognition();
-                recognition.continuous = true;
-                recognition.interimResults = true;
-                recognition.lang = 'en-US';
-
-                recognition.onstart = () => {
-                    statusSpan.innerText = "Listening with browser speech recognition";
-                    statusSpan.style.color = "#10b981";
-                };
-
-                recognition.onresult = (event) => {
-                    browserInterimTranscript = "";
-                    for (let i = event.resultIndex; i < event.results.length; i += 1) {
-                        const piece = event.results[i][0].transcript;
-                        if (event.results[i].isFinal) {
-                            browserTranscript += piece + " ";
-                        } else {
-                            browserInterimTranscript += piece + " ";
-                        }
-                    }
-                    renderBrowserTranscript();
-                };
-
-                recognition.onerror = (event) => {
-                    statusSpan.innerText = `Browser speech recognition error: ${event.error}`;
-                    statusSpan.style.color = "#ef4444";
-                };
-
-                recognition.onend = () => {
-                    if (!userStoppedRealtime && recognition) {
-                        recognition.start();
-                    }
-                };
-
-                recognition.start();
-                return true;
-            };
-
-            denoiseCheckbox.onchange = () => {
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
-                }
-            };
-
-            startBtn.onclick = async () => {
-                userStoppedRealtime = false;
-                usingBrowserRecognition = false;
-                const wsUrl = getWebSocketUrl();
-                console.log("Connecting to WebSocket:", wsUrl);
-                
-                try {
-                    socket = new WebSocket(wsUrl);
-                    let opened = false;
-                    
-                    socket.onerror = (err) => {
-                        console.error("WebSocket Error Object:", err);
-                        if (!opened && !usingBrowserRecognition) {
-                            statusSpan.innerText = "Realtime server unavailable, using browser mode";
-                            statusSpan.style.color = "#f59e0b";
-                            startBrowserRecognition();
-                        }
-                    };
-
-                    socket.onopen = () => {
-                        opened = true;
-                        statusSpan.innerText = "Connected";
-                        statusSpan.style.color = "#10b981";
-                        socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
-                    };
-
-                    socket.onmessage = (event) => {
-                        const data = JSON.parse(event.data);
-                        if (data.type === "final") {
-                            transcriptDiv.innerText += data.text + " ";
-                            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
-                        } else if (data.type === "error") {
-                            statusSpan.innerText = "Error: " + data.message;
-                            statusSpan.style.color = "#ef4444";
-                        }
-                    };
-
-                    socket.onclose = () => {
-                        if (!opened && !usingBrowserRecognition && !userStoppedRealtime) {
-                            statusSpan.innerText = "Realtime server unavailable, using browser mode";
-                            statusSpan.style.color = "#f59e0b";
-                            startBrowserRecognition();
-                            return;
-                        }
-                        if (!usingBrowserRecognition) {
-                            statusSpan.innerText = "Disconnected";
-                            statusSpan.style.color = "#64748b";
-                        }
-                    };
-                } catch (e) {
-                    statusSpan.innerText = "Connection Failed";
-                    statusSpan.style.color = "#ef4444";
-                    console.error("WebSocket construction failed:", e);
-                    if (!startBrowserRecognition()) {
-                        return;
-                    }
-                }
-
-                try {
-                    if (!usingBrowserRecognition) {
-                        audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
-                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                        input = audioContext.createMediaStreamSource(stream);
-                        processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-                        processor.onaudioprocess = (e) => {
-                            const channelData = e.inputBuffer.getChannelData(0);
-                            if (socket && socket.readyState === WebSocket.OPEN) {
-                                socket.send(channelData.buffer);
-                            }
-                        };
-
-                        input.connect(processor);
-                        processor.connect(audioContext.destination);
-                    }
-
-                    startBtn.disabled = true;
-                    startBtn.style.background = "#e2e8f0";
-                    stopBtn.disabled = false;
-                    stopBtn.style.background = "#ef4444";
-                    stopBtn.style.color = "white";
-                } catch (err) {
-                    statusSpan.innerText = "Microphone access failed";
-                    statusSpan.style.color = "#ef4444";
-                    stopRealtimeCapture();
-                }
-            };
-
-            stopBtn.onclick = () => {
-                userStoppedRealtime = true;
-                usingBrowserRecognition = false;
-                stopRealtimeCapture();
-                startBtn.disabled = false;
-                startBtn.style.background = "#0f766e";
-                stopBtn.disabled = true;
-                stopBtn.style.background = "#e2e8f0";
-                stopBtn.style.color = "#64748b";
-                statusSpan.innerText = "Stopped";
-            };
-        </script>
-        """.replace("__WS_URL_HINT__", ws_url_hint),
-        height=320,
-    )
-
-
 def _render_app_page() -> None:
     _render_hero()
 
@@ -1313,27 +957,17 @@ def _render_app_page() -> None:
     _section_intro(
         "Input",
         (
-            "Pick how you want to interact with the app. Real-time mode is best for live dictation, "
-            "while upload mode is handy for pre-recorded test clips."
+            "Pick how you want to interact with the app. The microphone option works "
+            "directly in the browser, while upload mode is handy for pre-recorded test clips."
         ),
         anchor_id="input-section",
     )
 
     input_method = st.radio(
         "Audio source",
-        ["Real-time transcription", "Record with microphone", "Upload audio file"],
+        ["Record with microphone", "Upload audio file"],
         horizontal=True,
     )
-
-    denoise_enabled = st.checkbox(
-        "Apply AI Noise Reduction",
-        value=True,
-        help="Clean background noise before transcribing.",
-    )
-
-    if input_method == "Real-time transcription":
-        _render_realtime_transcription() # This already has its own denoise toggle in HTML
-        return
 
     audio_source = None
     if input_method == "Record with microphone":
@@ -1342,6 +976,7 @@ def _render_app_page() -> None:
         )
         audio_source = st.audio_input(
             "Record speech",
+            sample_rate=22050,
             key=f"audio-input-{st.session_state.audio_input_key}",
         )
     else:
@@ -1368,7 +1003,7 @@ def _render_app_page() -> None:
 
     try:
         transcriber = _load_transcriber(model_size)
-        audio, result, report = _transcribe(audio_source, transcriber, language=language, denoise=denoise_enabled)
+        audio, result, report = _transcribe(audio_source, transcriber, language=language)
     except RuntimeError as exc:
         st.error(str(exc))
         st.caption(
@@ -1401,40 +1036,6 @@ def _render_app_page() -> None:
             "N/A" if result.language_confidence is None else f"{result.language_confidence:.1%}",
         )
         st.metric("Transcript duration", f"{result.duration_seconds:.1f}s")
-        
-        # Task: Export Options
-        st.markdown("### Export Transcript")
-        export_col1, export_col2 = st.columns(2)
-        with export_col1:
-            st.download_button(
-                "Plain Text (.txt)",
-                data=result.to_txt(),
-                file_name=f"transcript_{audio_source.name}.txt",
-                mime="text/plain",
-                use_container_width=True
-            )
-            st.download_button(
-                "Subtitles (.srt)",
-                data=result.to_srt(),
-                file_name=f"transcript_{audio_source.name}.srt",
-                mime="text/plain",
-                use_container_width=True
-            )
-        with export_col2:
-            st.download_button(
-                "Data (.json)",
-                data=result.to_json(),
-                file_name=f"transcript_{audio_source.name}.json",
-                mime="application/json",
-                use_container_width=True
-            )
-            st.download_button(
-                "Table (.csv)",
-                data=result.to_csv(),
-                file_name=f"transcript_{audio_source.name}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
 
     if result.segments:
         _section_intro(

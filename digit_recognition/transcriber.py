@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-import logging
 import math
 from pathlib import Path
 import tempfile
 from typing import Iterable, Optional, Sequence
-import wave
 
 import numpy as np
 
@@ -97,51 +94,6 @@ class TranscriptionResult:
             ],
         }
 
-    def to_txt(self) -> str:
-        return self.text
-
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), indent=2)
-
-    def to_csv(self) -> str:
-        rows: list[str] = []
-        header = ["start_seconds", "end_seconds", "confidence", "text"]
-        rows.append(",".join(header))
-        for segment in self.segments:
-            row = [
-                f"{segment.start_seconds:.3f}",
-                f"{segment.end_seconds:.3f}",
-                f"{segment.confidence:.6f}",
-                '"' + segment.text.replace('"', '""') + '"',
-            ]
-            rows.append(",".join(row))
-        return "\n".join(rows)
-
-    def to_srt(self) -> str:
-        def _format_timestamp(value: float) -> str:
-            total_ms = max(int(round(value * 1000)), 0)
-            hours, remainder = divmod(total_ms, 3_600_000)
-            minutes, remainder = divmod(remainder, 60_000)
-            seconds, milliseconds = divmod(remainder, 1000)
-            return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
-
-        if not self.segments:
-            end_time = max(self.duration_seconds, 0.0)
-            return (
-                "1\n"
-                f"{_format_timestamp(0.0)} --> {_format_timestamp(end_time)}\n"
-                f"{self.text}\n"
-            )
-
-        entries = []
-        for index, segment in enumerate(self.segments, start=1):
-            entries.append(
-                f"{index}\n"
-                f"{_format_timestamp(segment.start_seconds)} --> {_format_timestamp(segment.end_seconds)}\n"
-                f"{segment.text}\n"
-            )
-        return "\n".join(entries)
-
 
 class SpeechTranscriber:
     """Transcribe speech from audio files or arrays."""
@@ -163,12 +115,6 @@ class SpeechTranscriber:
     def _load_model(self):
         if self._model is not None:
             return self._model
-        
-        # Check if model is already loaded in a global/class variable to save memory
-        if hasattr(SpeechTranscriber, "_shared_model") and SpeechTranscriber._shared_model is not None:
-            self._model = SpeechTranscriber._shared_model
-            return self._model
-
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:  # pragma: no cover - depends on environment
@@ -181,21 +127,17 @@ class SpeechTranscriber:
             resolved_device = "cpu"
             try:
                 import torch
+
                 if torch.cuda.is_available():
                     resolved_device = "cuda"
             except ImportError:
                 resolved_device = "cpu"
 
-        logger = logging.getLogger(__name__)
-        logger.info(f"Loading Whisper model '{self.model_size}' on {resolved_device}...")
-        
         self._model = WhisperModel(
             self.model_size,
             device=resolved_device,
             compute_type=self.compute_type,
         )
-        # Store as shared model for other instances
-        SpeechTranscriber._shared_model = self._model
         return self._model
 
     def _result_from_segments(self, segments: Sequence[object], info: object) -> TranscriptionResult:
@@ -251,34 +193,27 @@ class SpeechTranscriber:
         language: str | None = None,
         vad_filter: bool = True,
     ) -> TranscriptionResult:
+        try:
+            import soundfile as sf
+        except ImportError as exc:  # pragma: no cover - depends on environment
+            raise ImportError(
+                "soundfile is required to transcribe NumPy arrays. Install requirements.txt first."
+            ) from exc
+
         audio = np.asarray(audio_array, dtype=np.float32)
         if sample_rate and sample_rate != self.processor.sample_rate:
-            try:
-                import librosa
+            import librosa
 
-                audio = librosa.resample(
-                    audio,
-                    orig_sr=sample_rate,
-                    target_sr=self.processor.sample_rate,
-                )
-            except ImportError:
-                audio = self.processor.resample_audio(audio, sample_rate, self.processor.sample_rate)
+            audio = librosa.resample(
+                audio,
+                orig_sr=sample_rate,
+                target_sr=self.processor.sample_rate,
+            )
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_path = Path(temp_file.name)
         try:
-            try:
-                import soundfile as sf
-
-                sf.write(temp_path, audio, self.processor.sample_rate)
-            except ImportError:
-                clipped = np.clip(audio, -1.0, 1.0)
-                pcm16 = (clipped * 32767.0).astype(np.int16)
-                with wave.open(str(temp_path), "wb") as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(self.processor.sample_rate)
-                    wav_file.writeframes(pcm16.tobytes())
+            sf.write(temp_path, audio, self.processor.sample_rate)
             return self.transcribe_file(temp_path, language=language, vad_filter=vad_filter)
         finally:
             temp_path.unlink(missing_ok=True)
