@@ -16,6 +16,8 @@ Product requirements for this release: [`docs/speech-to-text-prd.md`](docs/speec
 - `streamlit_app.py`: the interactive Streamlit app for microphone and file-based transcription.
 - `digit_recognition/transcriber.py`: reusable speech-to-text module powered by `faster-whisper`.
 - `digit_recognition/audio.py`: shared audio loading, normalization, waveform preparation, and quality checks.
+- `requirements.txt`: runtime dependencies for the Streamlit transcription app.
+- `requirements-training.txt`: optional legacy training and model dependencies such as `torch` and `scikit-learn`.
 - `tests/`: smoke tests for audio utilities, legacy digit-model code, and new transcription helpers.
 - `Digit_Classification_from_Audio.ipynb`, `training.py`, and `evaluation.py`: legacy digit-classification artifacts retained for reference.
 
@@ -72,7 +74,13 @@ Recommended Python version:
 
 - Python `3.11` or `3.12`
 
-If you deploy on Streamlit Community Cloud, choose the Python version from the deployment `Advanced settings`. Streamlit Community Cloud defaults can change over time, and the current dependency stack in this repo is most reliable on Python `3.11` or `3.12`. See the official docs: [Deploy your app](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy) and [Manage dependencies](https://docs.streamlit.io/deploy/concepts/dependencies).
+If you deploy on Streamlit Community Cloud, choose the Python version from the deployment `Advanced settings`. Streamlit Community Cloud defaults can change over time, and the current dependency stack in this repo is most reliable on Python `3.11` or `3.12`. The app's `requirements.txt` is intentionally runtime-only so Community Cloud does not need to install legacy training packages that the live transcription app does not use. See the official docs: [Deploy your app](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy) and [Manage dependencies](https://docs.streamlit.io/deploy/concepts/dependencies).
+
+If you need the legacy training or digit-model pipeline locally, install the extra training dependencies as well:
+
+```bash
+python -m pip install -r requirements-training.txt
+```
 
 When Streamlit starts locally, open the URL shown in your terminal, usually:
 
@@ -144,6 +152,7 @@ Speech-to-text-generation-engine/
 │   ├── training.py
 │   └── transcriber.py
 ├── requirements-dev.txt
+├── requirements-training.txt
 ├── requirements.txt
 ├── streamlit_app.py
 ├── tests/
