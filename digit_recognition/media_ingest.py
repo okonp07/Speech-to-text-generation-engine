@@ -122,7 +122,7 @@ def fetch_youtube_audio(
     work_dir = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="yt_audio_"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    ydl_opts = {
+    base_opts = {
         "format": "bestaudio/best",
         "outtmpl": str(work_dir / "%(title).120s.%(ext)s"),
         "postprocessors": [
@@ -136,20 +136,49 @@ def fetch_youtube_audio(
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": False,
+        # Retries help with flaky connections and transient 403s.
+        "retries": 3,
+        "fragment_retries": 3,
+        # Default UA some YouTube "bot check" paths accept.
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        },
     }
 
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url.strip(), download=True)
-    except DownloadError as exc:
-        raise MediaIngestError(
-            "Could not download that YouTube video. It may be private, "
-            "region-restricted, or require sign-in."
-        ) from exc
-    except Exception as exc:  # pragma: no cover - defensive
-        raise MediaIngestError(f"YouTube download failed: {exc}") from exc
+    # YouTube often rotates which "player client" works at a given moment.
+    # Try a few in order; the first one that succeeds wins. This avoids a
+    # single transient client failure killing the whole request.
+    client_fallbacks: tuple[tuple[str, ...], ...] = (
+        ("android",),
+        ("web",),
+        ("tv_embedded",),
+        ("ios",),
+    )
 
-    title = info.get("title") or "youtube_audio"
+    last_error: Exception | None = None
+    info = None
+    for clients in client_fallbacks:
+        opts = {
+            **base_opts,
+            "extractor_args": {"youtube": {"player_client": list(clients)}},
+        }
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url.strip(), download=True)
+            break
+        except DownloadError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            last_error = exc
+            continue
+
+    if info is None:
+        raise MediaIngestError(_format_ytdlp_error(last_error)) from last_error
 
     # yt-dlp renames the post-processed file. Find whatever audio file is
     # now newest in the work directory rather than reconstructing its name.
@@ -233,6 +262,45 @@ def extract_audio_from_video(
         display_name=(display_name or video_path.name),
         source_description=f"Video: {display_name or video_path.name}",
     )
+
+
+def _format_ytdlp_error(exc: Exception | None) -> str:
+    """Turn a raw yt-dlp error into something actionable for the UI."""
+
+    if exc is None:
+        return "YouTube download failed for an unknown reason."
+
+    raw = str(exc).strip()
+    # yt-dlp messages often have ANSI color and "[youtube] VIDEOID:" prefixes;
+    # strip those so the UI shows a clean message.
+    raw = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+    # Keep the most informative tail of the message.
+    clean = raw.splitlines()[-1] if raw else ""
+
+    lowered = clean.lower()
+    if "sign in" in lowered and "bot" in lowered:
+        return (
+            "YouTube is challenging this request with a bot check. This usually "
+            "happens from cloud IPs (e.g. Streamlit Community Cloud). Try a "
+            "different video, run the app locally, or supply YouTube cookies. "
+            f"Original error: {clean}"
+        )
+    if "private video" in lowered:
+        return "This YouTube video is private and cannot be downloaded."
+    if "age" in lowered and "confirm" in lowered:
+        return (
+            "This video is age-restricted and requires sign-in. "
+            "yt-dlp cannot fetch it anonymously."
+        )
+    if "members-only" in lowered or "members only" in lowered:
+        return "This video is members-only and cannot be downloaded anonymously."
+    if "not available in your country" in lowered or "geo" in lowered:
+        return "This video is region-restricted for your server's location."
+    if "unavailable" in lowered:
+        return f"YouTube reports this video as unavailable. Details: {clean}"
+
+    # Fallback: include the real yt-dlp message so the user can act on it.
+    return f"YouTube download failed. Details: {clean or raw[:300]}"
 
 
 def _newest_audio_file(directory: Path) -> Optional[Path]:

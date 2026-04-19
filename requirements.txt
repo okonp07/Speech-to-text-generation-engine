@@ -7,4 +7,4 @@ streamlit>=1.32
 pandas>=2.1
 soundfile>=0.12
 faster-whisper>=1.1
-yt-dlp>=2024.8.6
+yt-dlp>=2025.3.1
