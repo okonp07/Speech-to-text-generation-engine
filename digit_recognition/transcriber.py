@@ -6,15 +6,33 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import tempfile
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 import numpy as np
+
+
+# (seconds_processed_so_far, total_seconds_or_None) -> None
+ProgressCallback = Callable[[float, Optional[float]], None]
 
 from .audio import AudioProcessor
 
 
 DEFAULT_TRANSCRIPTION_MODEL = "tiny"
 DEFAULT_BEAM_SIZE = 5
+
+
+def _maybe_float(value: object) -> Optional[float]:
+    """Best-effort conversion to ``float``; returns ``None`` on failure."""
+
+    if value is None:
+        return None
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(result) or math.isinf(result):
+        return None
+    return result
 
 
 def _clamp_probability(value: float) -> float:
@@ -174,7 +192,17 @@ class SpeechTranscriber:
         audio_path: str | Path,
         language: str | None = None,
         vad_filter: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> TranscriptionResult:
+        """Transcribe a local audio file.
+
+        If ``progress_callback`` is supplied, it is called after every
+        segment the model produces, with ``(seconds_processed_so_far,
+        total_audio_seconds)``. ``total_audio_seconds`` may be ``None``
+        if the model couldn't determine it (rare). Callbacks let the
+        UI render a live progress bar without any polling.
+        """
+
         model = self._load_model()
         segments, info = model.transcribe(
             str(audio_path),
@@ -183,8 +211,39 @@ class SpeechTranscriber:
             word_timestamps=True,
             language=language,
         )
-        materialized_segments = tuple(segments)
-        return self._result_from_segments(materialized_segments, info)
+
+        # ``info.duration`` is the full audio length in seconds. It's
+        # set after the generator is created but before the first
+        # segment is yielded, so we can pass it to every callback.
+        total_seconds = _maybe_float(getattr(info, "duration", None))
+
+        materialized: list[object] = []
+        last_reported = 0.0
+        for segment in segments:
+            materialized.append(segment)
+            if progress_callback is not None:
+                end = _maybe_float(getattr(segment, "end", None)) or last_reported
+                # Whisper can emit slightly non-monotonic ends in rare
+                # cases; make the reported progress monotone so the
+                # progress bar never appears to go backwards.
+                if end < last_reported:
+                    end = last_reported
+                last_reported = end
+                try:
+                    progress_callback(end, total_seconds)
+                except Exception:
+                    # Progress UI must never crash the transcription.
+                    pass
+
+        # Emit a final 100% tick so the bar always lands on "done"
+        # even if the last segment's end is a hair below duration.
+        if progress_callback is not None and total_seconds:
+            try:
+                progress_callback(total_seconds, total_seconds)
+            except Exception:
+                pass
+
+        return self._result_from_segments(tuple(materialized), info)
 
     def transcribe_array(
         self,
@@ -192,6 +251,7 @@ class SpeechTranscriber:
         sample_rate: int | None = None,
         language: str | None = None,
         vad_filter: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> TranscriptionResult:
         try:
             import soundfile as sf
@@ -214,7 +274,12 @@ class SpeechTranscriber:
             temp_path = Path(temp_file.name)
         try:
             sf.write(temp_path, audio, self.processor.sample_rate)
-            return self.transcribe_file(temp_path, language=language, vad_filter=vad_filter)
+            return self.transcribe_file(
+                temp_path,
+                language=language,
+                vad_filter=vad_filter,
+                progress_callback=progress_callback,
+            )
         finally:
             temp_path.unlink(missing_ok=True)
 

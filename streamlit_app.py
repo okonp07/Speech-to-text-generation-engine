@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -43,6 +45,26 @@ REPO_URL = "https://github.com/okonp07/Speech-to-text-generation-engine"
 FUTURE_DEVELOPMENT_URL = f"{REPO_URL}/blob/main/future-development.md"
 FEEDBACK_FILE = Path(__file__).resolve().parent / "feedback_responses.csv"
 HeroPill = tuple[str, str]
+
+
+def _format_duration(seconds: float | None) -> str:
+    """Render a non-negative number of seconds as ``"Hh Mm Ss"`` style.
+
+    ``None`` / negative values return an em-dash so the UI can say
+    "ETA — " without breaking. Short durations drop the hour and
+    minute prefixes to keep the readout compact.
+    """
+
+    if seconds is None or seconds < 0 or not math.isfinite(seconds):
+        return "—"
+    seconds = int(round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def _render_video_file_workaround(headline: str) -> None:
@@ -865,14 +887,21 @@ def _transcript_html(result: "TranscriptionResult") -> str:
     )
 
 
-def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str | None):
+def _transcribe(
+    uploaded_file,
+    transcriber: "SpeechTranscriber",
+    language: str | None,
+    progress_callback=None,
+):
     suffix = Path(uploaded_file.name).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
         temp_file.write(uploaded_file.getbuffer())
         temp_path = Path(temp_file.name)
 
     try:
-        return _transcribe_local_path(temp_path, transcriber, language)
+        return _transcribe_local_path(
+            temp_path, transcriber, language, progress_callback=progress_callback
+        )
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -881,6 +910,7 @@ def _transcribe_local_path(
     audio_path: Path,
     transcriber: "SpeechTranscriber",
     language: str | None,
+    progress_callback=None,
 ):
     """Shared transcription helper for files already on disk.
 
@@ -889,7 +919,9 @@ def _transcribe_local_path(
     state) rather than deleting straight away.
     """
 
-    result = transcriber.transcribe_file(audio_path, language=language)
+    result = transcriber.transcribe_file(
+        audio_path, language=language, progress_callback=progress_callback
+    )
     audio = transcriber.processor.load_audio(audio_path)
     report = transcriber.processor.quality_report(audio)
     return audio, result, report
@@ -1187,28 +1219,111 @@ def _run_and_render(
     *audio_path* (a Path on disk produced by media_ingest) must be provided.
     """
 
+    # Live progress UI. Rendered inside its own container so we can wipe
+    # the whole block in one call once transcription is done — no
+    # half-complete progress bar lingering above the result panel.
+    progress_container = st.container()
+    with progress_container:
+        progress_status = st.empty()
+        progress_bar = st.progress(0.0, text="Loading model and audio…")
+        progress_meta = st.empty()
+
+    start_time = time.monotonic()
+    # Throttle UI updates so we don't hammer Streamlit with a redraw on
+    # every Whisper segment (some clips emit 100+ per minute).
+    last_update_time = [0.0]
+
+    def progress_callback(seconds_processed: float, total_seconds):
+        now = time.monotonic()
+        # 200ms throttle; always allow the final 100% update through.
+        if now - last_update_time[0] < 0.2 and (
+            total_seconds is None or seconds_processed < total_seconds
+        ):
+            return
+        last_update_time[0] = now
+
+        elapsed = now - start_time
+        if total_seconds and total_seconds > 0:
+            fraction = max(0.0, min(1.0, seconds_processed / total_seconds))
+            eta = (
+                (elapsed * (1.0 - fraction) / fraction)
+                if fraction > 0
+                else None
+            )
+            progress_bar.progress(
+                fraction,
+                text=(
+                    f"Transcribing… {int(fraction * 100)}% "
+                    f"({_format_duration(seconds_processed)} of "
+                    f"{_format_duration(total_seconds)})"
+                ),
+            )
+            progress_meta.caption(
+                f"⏱️ Elapsed {_format_duration(elapsed)}  •  "
+                f"⏳ ETA {_format_duration(eta)}"
+            )
+        else:
+            # Total unknown — show an indeterminate-style readout.
+            progress_bar.progress(
+                0.0,
+                text=(
+                    f"Transcribing… processed "
+                    f"{_format_duration(seconds_processed)} so far"
+                ),
+            )
+            progress_meta.caption(f"⏱️ Elapsed {_format_duration(elapsed)}")
+
     try:
+        progress_status.caption(
+            f"Loading the **{model_size}** Whisper model. The first run "
+            "of a new model size pulls weights from the network and may "
+            "take a moment."
+        )
         transcriber = _load_transcriber(model_size)
+        progress_status.caption(
+            "Model loaded. Streaming Whisper segments — progress updates "
+            "as audio is processed."
+        )
         if audio_source is not None:
-            audio, result, report = _transcribe(audio_source, transcriber, language=language)
+            audio, result, report = _transcribe(
+                audio_source,
+                transcriber,
+                language=language,
+                progress_callback=progress_callback,
+            )
         elif audio_path is not None:
-            audio, result, report = _transcribe_local_path(audio_path, transcriber, language=language)
+            audio, result, report = _transcribe_local_path(
+                audio_path,
+                transcriber,
+                language=language,
+                progress_callback=progress_callback,
+            )
         else:  # pragma: no cover - defensive
+            progress_container.empty()
             st.error("No audio source was provided to the transcriber.")
             return
     except RuntimeError as exc:
+        progress_container.empty()
         st.error(str(exc))
         st.caption(
             "If you deploy on Streamlit Community Cloud, choose Python 3.11 or 3.12 in Advanced settings."
         )
         return
     except Exception as exc:
+        progress_container.empty()
         st.error(f"Transcription failed ({source_kind}): {exc}")
         st.caption(
             "If this is the first run, confirm that model downloads are allowed in the deployment environment."
         )
         return
 
+    # Wipe the live progress UI now that the result is ready.
+    progress_container.empty()
+    total_elapsed = time.monotonic() - start_time
+    st.success(
+        f"Transcribed in {_format_duration(total_elapsed)} "
+        f"({_format_duration(result.duration_seconds)} of audio)."
+    )
     _render_results_panel(audio, result, report, display_name, transcriber)
 
 
