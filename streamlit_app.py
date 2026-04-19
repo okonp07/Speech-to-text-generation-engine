@@ -14,6 +14,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from digit_recognition.exports import build_json, build_srt, build_txt, build_vtt
+from digit_recognition.media_ingest import (
+    SUPPORTED_VIDEO_EXTENSIONS,
+    MediaIngestError,
+    extract_audio_from_video,
+    fetch_youtube_audio,
+    is_valid_youtube_url,
+)
+
 if TYPE_CHECKING:
     from digit_recognition.transcriber import SpeechTranscriber, TranscriptionResult
 
@@ -799,13 +808,71 @@ def _transcribe(uploaded_file, transcriber: "SpeechTranscriber", language: str |
         temp_path = Path(temp_file.name)
 
     try:
-        result = transcriber.transcribe_file(temp_path, language=language)
-        audio = transcriber.processor.load_audio(temp_path)
-        report = transcriber.processor.quality_report(audio)
+        return _transcribe_local_path(temp_path, transcriber, language)
     finally:
         temp_path.unlink(missing_ok=True)
 
+
+def _transcribe_local_path(
+    audio_path: Path,
+    transcriber: "SpeechTranscriber",
+    language: str | None,
+):
+    """Shared transcription helper for files already on disk.
+
+    Used by the YouTube URL and video file tabs, where ingestion produces a
+    local path we want to keep alive across reruns (cached in session
+    state) rather than deleting straight away.
+    """
+
+    result = transcriber.transcribe_file(audio_path, language=language)
+    audio = transcriber.processor.load_audio(audio_path)
+    report = transcriber.processor.quality_report(audio)
     return audio, result, report
+
+
+def _safe_basename(name: str) -> str:
+    stem = Path(name).stem or "transcript"
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)[:80] or "transcript"
+
+
+def _render_download_buttons(result: "TranscriptionResult", base_name: str) -> None:
+    """Four download buttons matching the reference notebook output set."""
+
+    base = _safe_basename(base_name)
+    col_txt, col_srt, col_vtt, col_json = st.columns(4)
+    with col_txt:
+        st.download_button(
+            "Download .txt",
+            data=build_txt(result),
+            file_name=f"{base}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+    with col_srt:
+        st.download_button(
+            "Download .srt",
+            data=build_srt(result),
+            file_name=f"{base}.srt",
+            mime="application/x-subrip",
+            use_container_width=True,
+        )
+    with col_vtt:
+        st.download_button(
+            "Download .vtt",
+            data=build_vtt(result),
+            file_name=f"{base}.vtt",
+            mime="text/vtt",
+            use_container_width=True,
+        )
+    with col_json:
+        st.download_button(
+            "Download .json",
+            data=build_json(result),
+            file_name=f"{base}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
 
 def _render_about_page() -> None:
@@ -921,99 +988,14 @@ def _render_about_page() -> None:
             st.image(AUTHOR_IMAGE, use_container_width=True)
 
 
-def _render_app_page() -> None:
-    _render_hero()
-
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "audio_input_key" not in st.session_state:
-        st.session_state.audio_input_key = 0
-    if "file_uploader_key" not in st.session_state:
-        st.session_state.file_uploader_key = 0
-
-    with st.sidebar:
-        st.markdown("### Control Panel")
-        model_label = st.selectbox(
-            "Transcription model",
-            ["Fast (tiny)", "Balanced (base)", "Detailed (small)"],
-            index=1,
-        )
-        model_size = {
-            "Fast (tiny)": "tiny",
-            "Balanced (base)": "base",
-            "Detailed (small)": "small",
-        }[model_label]
-        language_label = st.selectbox(
-            "Language hint",
-            ["Auto detect", "English"],
-            index=0,
-        )
-        language = None if language_label == "Auto detect" else "en"
-        st.markdown("Supported formats: WAV, MP3, M4A, FLAC, OGG")
-        st.markdown("---")
-        st.caption("The first run may take longer while the speech model downloads.")
-        st.caption("Best results come from clear speech and low background noise.")
-
-    _section_intro(
-        "Input",
-        (
-            "Pick how you want to interact with the app. The microphone option works "
-            "directly in the browser, while upload mode is handy for pre-recorded test clips."
-        ),
-        anchor_id="input-section",
-    )
-
-    input_method = st.radio(
-        "Audio source",
-        ["Record with microphone", "Upload audio file"],
-        horizontal=True,
-    )
-
-    audio_source = None
-    if input_method == "Record with microphone":
-        st.caption(
-            "Click record, allow microphone access in your browser, speak naturally, then stop recording."
-        )
-        audio_source = st.audio_input(
-            "Record speech",
-            sample_rate=22050,
-            key=f"audio-input-{st.session_state.audio_input_key}",
-        )
-    else:
-        audio_source = st.file_uploader(
-            "Upload an audio file containing speech",
-            type=["wav", "mp3", "m4a", "flac", "ogg"],
-            key=f"file-uploader-{st.session_state.file_uploader_key}",
-        )
-
-    controls_left, controls_right = st.columns([1, 3])
-    with controls_left:
-        if st.button("Clear current audio", use_container_width=True):
-            if input_method == "Record with microphone":
-                st.session_state.audio_input_key += 1
-            else:
-                st.session_state.file_uploader_key += 1
-            st.rerun()
-
-    if not audio_source:
-        st.info("Record or upload audio to start.")
-        return
-
-    st.audio(audio_source)
-
-    try:
-        transcriber = _load_transcriber(model_size)
-        audio, result, report = _transcribe(audio_source, transcriber, language=language)
-    except RuntimeError as exc:
-        st.error(str(exc))
-        st.caption(
-            "If you deploy on Streamlit Community Cloud, choose Python 3.11 or 3.12 in Advanced settings."
-        )
-        return
-    except Exception as exc:
-        st.error(f"Transcription failed: {exc}")
-        st.caption("If this is the first run, confirm that model downloads are allowed in the deployment environment.")
-        return
+def _render_results_panel(
+    audio: np.ndarray,
+    result: "TranscriptionResult",
+    report,
+    display_name: str,
+    transcriber: "SpeechTranscriber",
+) -> None:
+    """Shared rendering used by every input source."""
 
     st.markdown(
         """
@@ -1036,6 +1018,12 @@ def _render_app_page() -> None:
             "N/A" if result.language_confidence is None else f"{result.language_confidence:.1%}",
         )
         st.metric("Transcript duration", f"{result.duration_seconds:.1f}s")
+
+    _section_intro(
+        "Download transcript",
+        "Save the transcript alongside time-coded SRT/VTT subtitles and a full JSON dump.",
+    )
+    _render_download_buttons(result, display_name)
 
     if result.segments:
         _section_intro(
@@ -1086,7 +1074,7 @@ def _render_app_page() -> None:
 
     st.session_state.history.append(
         {
-            "file": audio_source.name,
+            "file": display_name,
             "transcript_preview": result.text[:80] + ("..." if len(result.text) > 80 else ""),
             "confidence": round(result.confidence, 4),
             "language": result.language,
@@ -1105,6 +1093,286 @@ def _render_app_page() -> None:
         unsafe_allow_html=True,
     )
     st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
+
+
+def _run_and_render(
+    source_kind: str,
+    audio_source,
+    audio_path: Path | None,
+    display_name: str,
+    model_size: str,
+    language: str | None,
+) -> None:
+    """Load the transcriber, transcribe, then render the shared results panel.
+
+    Exactly one of *audio_source* (an UploadedFile / AudioInput result) and
+    *audio_path* (a Path on disk produced by media_ingest) must be provided.
+    """
+
+    try:
+        transcriber = _load_transcriber(model_size)
+        if audio_source is not None:
+            audio, result, report = _transcribe(audio_source, transcriber, language=language)
+        elif audio_path is not None:
+            audio, result, report = _transcribe_local_path(audio_path, transcriber, language=language)
+        else:  # pragma: no cover - defensive
+            st.error("No audio source was provided to the transcriber.")
+            return
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.caption(
+            "If you deploy on Streamlit Community Cloud, choose Python 3.11 or 3.12 in Advanced settings."
+        )
+        return
+    except Exception as exc:
+        st.error(f"Transcription failed ({source_kind}): {exc}")
+        st.caption(
+            "If this is the first run, confirm that model downloads are allowed in the deployment environment."
+        )
+        return
+
+    _render_results_panel(audio, result, report, display_name, transcriber)
+
+
+def _render_app_page() -> None:
+    _render_hero()
+
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if "audio_input_key" not in st.session_state:
+        st.session_state.audio_input_key = 0
+    if "file_uploader_key" not in st.session_state:
+        st.session_state.file_uploader_key = 0
+    if "video_uploader_key" not in st.session_state:
+        st.session_state.video_uploader_key = 0
+    if "youtube_url_value" not in st.session_state:
+        st.session_state.youtube_url_value = ""
+    # Caches of ingested local audio paths, keyed so we don't re-download /
+    # re-extract on every Streamlit rerun.
+    if "youtube_cache" not in st.session_state:
+        st.session_state.youtube_cache = {}  # {url: (Path, display_name)}
+    if "video_cache" not in st.session_state:
+        st.session_state.video_cache = {}  # {cache_key: (Path, display_name)}
+
+    with st.sidebar:
+        st.markdown("### Control Panel")
+        model_label = st.selectbox(
+            "Transcription model",
+            ["Fast (tiny)", "Balanced (base)", "Detailed (small)"],
+            index=1,
+        )
+        model_size = {
+            "Fast (tiny)": "tiny",
+            "Balanced (base)": "base",
+            "Detailed (small)": "small",
+        }[model_label]
+        language_label = st.selectbox(
+            "Language hint",
+            ["Auto detect", "English"],
+            index=0,
+        )
+        language = None if language_label == "Auto detect" else "en"
+        st.markdown("Supported audio: WAV, MP3, M4A, FLAC, OGG")
+        st.markdown("Supported video: MP4, MOV, MKV, WEBM, AVI, M4V")
+        st.markdown("YouTube: paste any public watch / shorts / youtu.be link")
+        st.markdown("---")
+        st.caption("The first run may take longer while the speech model downloads.")
+        st.caption("Best results come from clear speech and low background noise.")
+        st.caption("YouTube + video flows require ffmpeg on the host.")
+
+    _section_intro(
+        "Input",
+        (
+            "Pick how you want to feed audio into the app. You can record in the browser, "
+            "upload an audio or video file, or paste a YouTube link."
+        ),
+        anchor_id="input-section",
+    )
+
+    mic_tab, audio_tab, video_tab, youtube_tab = st.tabs(
+        ["🎤 Microphone", "📁 Audio file", "🎞️ Video file", "▶️ YouTube URL"]
+    )
+
+    # --- Microphone tab ------------------------------------------------------
+    with mic_tab:
+        st.caption(
+            "Click record, allow microphone access in your browser, speak naturally, "
+            "then stop recording."
+        )
+        mic_audio = st.audio_input(
+            "Record speech",
+            sample_rate=22050,
+            key=f"audio-input-{st.session_state.audio_input_key}",
+        )
+        if st.button("Clear recording", key="clear-mic"):
+            st.session_state.audio_input_key += 1
+            st.rerun()
+
+        if mic_audio:
+            st.audio(mic_audio)
+            _run_and_render(
+                source_kind="microphone",
+                audio_source=mic_audio,
+                audio_path=None,
+                display_name=getattr(mic_audio, "name", "microphone.wav"),
+                model_size=model_size,
+                language=language,
+            )
+        else:
+            st.info("Record a clip to start.")
+
+    # --- Audio file tab ------------------------------------------------------
+    with audio_tab:
+        uploaded_audio = st.file_uploader(
+            "Upload an audio file containing speech",
+            type=["wav", "mp3", "m4a", "flac", "ogg"],
+            key=f"file-uploader-{st.session_state.file_uploader_key}",
+        )
+        if st.button("Clear uploaded audio", key="clear-audio"):
+            st.session_state.file_uploader_key += 1
+            st.rerun()
+
+        if uploaded_audio:
+            st.audio(uploaded_audio)
+            _run_and_render(
+                source_kind="audio file",
+                audio_source=uploaded_audio,
+                audio_path=None,
+                display_name=uploaded_audio.name,
+                model_size=model_size,
+                language=language,
+            )
+        else:
+            st.info("Upload an audio file to start.")
+
+    # --- Video file tab ------------------------------------------------------
+    with video_tab:
+        st.caption(
+            "Upload a video; the app extracts the audio track with ffmpeg and then transcribes it."
+        )
+        uploaded_video = st.file_uploader(
+            "Upload a video file",
+            type=[ext.lstrip(".") for ext in SUPPORTED_VIDEO_EXTENSIONS],
+            key=f"video-uploader-{st.session_state.video_uploader_key}",
+        )
+        col_go, col_clear = st.columns([1, 1])
+        with col_go:
+            run_video = st.button(
+                "Extract audio and transcribe",
+                key="run-video",
+                type="primary",
+                disabled=uploaded_video is None,
+                use_container_width=True,
+            )
+        with col_clear:
+            if st.button("Clear video", key="clear-video", use_container_width=True):
+                st.session_state.video_uploader_key += 1
+                st.session_state.video_cache = {}
+                st.rerun()
+
+        if uploaded_video is not None:
+            cache_key = f"{uploaded_video.name}:{uploaded_video.size}"
+            cached = st.session_state.video_cache.get(cache_key)
+
+            if run_video and cached is None:
+                with st.spinner("Extracting audio from video…"):
+                    try:
+                        video_tmp_dir = Path(tempfile.mkdtemp(prefix="video_src_"))
+                        video_tmp_path = video_tmp_dir / uploaded_video.name
+                        video_tmp_path.write_bytes(uploaded_video.getbuffer())
+                        ingested = extract_audio_from_video(
+                            video_tmp_path,
+                            display_name=uploaded_video.name,
+                        )
+                        st.session_state.video_cache[cache_key] = (
+                            ingested.audio_path,
+                            ingested.display_name,
+                        )
+                        cached = st.session_state.video_cache[cache_key]
+                    except MediaIngestError as exc:
+                        st.error(str(exc))
+                        cached = None
+
+            if cached is not None:
+                audio_path, display_name = cached
+                st.audio(str(audio_path))
+                _run_and_render(
+                    source_kind="video file",
+                    audio_source=None,
+                    audio_path=audio_path,
+                    display_name=display_name,
+                    model_size=model_size,
+                    language=language,
+                )
+            elif not run_video:
+                st.info("Upload a video, then click “Extract audio and transcribe”.")
+        else:
+            st.info("Upload a video file to start.")
+
+    # --- YouTube URL tab -----------------------------------------------------
+    with youtube_tab:
+        st.caption(
+            "Paste a YouTube link (watch, shorts, or youtu.be). The app uses yt-dlp to pull "
+            "the audio, then transcribes it exactly like any other source."
+        )
+        youtube_url = st.text_input(
+            "YouTube URL",
+            value=st.session_state.youtube_url_value,
+            placeholder="https://www.youtube.com/watch?v=…",
+            key="youtube-url-input",
+        )
+        st.session_state.youtube_url_value = youtube_url
+
+        col_go_yt, col_clear_yt = st.columns([1, 1])
+        with col_go_yt:
+            run_youtube = st.button(
+                "Download and transcribe",
+                key="run-youtube",
+                type="primary",
+                disabled=not youtube_url.strip(),
+                use_container_width=True,
+            )
+        with col_clear_yt:
+            if st.button("Clear URL and cache", key="clear-youtube", use_container_width=True):
+                st.session_state.youtube_url_value = ""
+                st.session_state.youtube_cache = {}
+                st.rerun()
+
+        url_key = youtube_url.strip()
+        cached_yt = st.session_state.youtube_cache.get(url_key)
+
+        if run_youtube and url_key:
+            if not is_valid_youtube_url(url_key):
+                st.error(
+                    "That does not look like a YouTube URL. Paste a link that starts "
+                    "with https://www.youtube.com/ or https://youtu.be/."
+                )
+            elif cached_yt is None:
+                with st.spinner("Downloading audio from YouTube…"):
+                    try:
+                        ingested = fetch_youtube_audio(url_key)
+                        st.session_state.youtube_cache[url_key] = (
+                            ingested.audio_path,
+                            ingested.display_name,
+                        )
+                        cached_yt = st.session_state.youtube_cache[url_key]
+                    except MediaIngestError as exc:
+                        st.error(str(exc))
+                        cached_yt = None
+
+        if cached_yt is not None:
+            audio_path, display_name = cached_yt
+            st.audio(str(audio_path))
+            _run_and_render(
+                source_kind="YouTube URL",
+                audio_source=None,
+                audio_path=audio_path,
+                display_name=display_name,
+                model_size=model_size,
+                language=language,
+            )
+        elif not run_youtube:
+            st.info("Paste a YouTube URL, then click “Download and transcribe”.")
 
 
 def main() -> None:
