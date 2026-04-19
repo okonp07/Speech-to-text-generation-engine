@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import tempfile
 from datetime import datetime, timezone
 from html import escape
@@ -42,6 +43,38 @@ REPO_URL = "https://github.com/okonp07/Speech-to-text-generation-engine"
 FUTURE_DEVELOPMENT_URL = f"{REPO_URL}/blob/main/future-development.md"
 FEEDBACK_FILE = Path(__file__).resolve().parent / "feedback_responses.csv"
 HeroPill = tuple[str, str]
+
+
+def _get_webshare_credentials() -> tuple[str | None, str | None]:
+    """Read Webshare proxy credentials from Streamlit secrets (or env).
+
+    Returns ``(username, password)``. Either or both may be ``None`` when
+    not configured — in that case the app falls back to a direct
+    connection (which works locally but not from blocked datacenter
+    IPs). Streamlit secrets are read first, then environment variables,
+    so the same code works in Cloud and in development.
+
+    The lookup never raises: a missing ``secrets.toml`` returns ``None``
+    cleanly, so first-run / unconfigured deploys still boot.
+    """
+
+    user: str | None = None
+    pwd: str | None = None
+    # st.secrets behaves like a mapping but raises StreamlitSecretNotFoundError
+    # when no secrets file exists at all. Wrap the whole lookup so
+    # unconfigured deploys boot without a crash.
+    try:
+        secrets = st.secrets  # may raise on first access if no file
+        user = secrets.get("WEBSHARE_PROXY_USERNAME") or None
+        pwd = secrets.get("WEBSHARE_PROXY_PASSWORD") or None
+    except Exception:
+        user = None
+        pwd = None
+    if not user:
+        user = os.environ.get("WEBSHARE_PROXY_USERNAME") or None
+    if not pwd:
+        pwd = os.environ.get("WEBSHARE_PROXY_PASSWORD") or None
+    return user, pwd
 
 
 def _inject_styles() -> None:
@@ -1363,9 +1396,20 @@ def _render_app_page() -> None:
         cached_yt = st.session_state.youtube_cache.get(url_key)
 
         if run_youtube and url_key and cached_yt is None:
-            with st.spinner("Fetching captions from YouTube…"):
+            ws_user, ws_pass = _get_webshare_credentials()
+            spinner_label = (
+                "Fetching captions from YouTube via Webshare proxy…"
+                if ws_user and ws_pass
+                else "Fetching captions from YouTube…"
+            )
+            with st.spinner(spinner_label):
                 try:
-                    result = fetch_youtube_captions(url_key, language_hint=language)
+                    result = fetch_youtube_captions(
+                        url_key,
+                        language_hint=language,
+                        webshare_proxy_username=ws_user,
+                        webshare_proxy_password=ws_pass,
+                    )
                     st.session_state.youtube_cache[url_key] = result
                     cached_yt = result
                 except InvalidYouTubeUrlError as exc:

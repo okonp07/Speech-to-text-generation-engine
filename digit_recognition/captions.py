@@ -79,6 +79,9 @@ def extract_video_id(url: str) -> str:
 def fetch_youtube_captions(
     url: str,
     language_hint: Optional[str] = None,
+    *,
+    webshare_proxy_username: Optional[str] = None,
+    webshare_proxy_password: Optional[str] = None,
 ) -> TranscriptionResult:
     """Fetch captions for *url* and return them as a :class:`TranscriptionResult`.
 
@@ -94,6 +97,13 @@ def fetch_youtube_captions(
         Preferred ISO language code (e.g. ``"en"``). When supplied, the
         corresponding track is tried first; we otherwise fall back to
         whatever track YouTube has. ``None`` means "let YouTube pick".
+    webshare_proxy_username / webshare_proxy_password:
+        Optional Webshare "Proxy Username" and "Proxy Password". When
+        both are set, requests are routed through Webshare's residential
+        proxy pool, which lets the captions endpoint succeed from
+        otherwise-blocked datacenter IPs (Streamlit Community Cloud,
+        Heroku, Railway, etc.). Leave unset when running locally — a
+        direct connection is faster.
     """
 
     try:
@@ -115,9 +125,16 @@ def fetch_youtube_captions(
         if fallback not in preferred_languages:
             preferred_languages.append(fallback)
 
+    proxy_config = _build_webshare_proxy_config(
+        webshare_proxy_username, webshare_proxy_password
+    )
+
     try:
         entries, chosen_language = _get_transcript_entries(
-            YouTubeTranscriptApi, video_id, preferred_languages
+            YouTubeTranscriptApi,
+            video_id,
+            preferred_languages,
+            proxy_config=proxy_config,
         )
     # ------------------------------------------------------------------
     # "Captions truly do not exist" — keep these as CaptionsUnavailable.
@@ -271,10 +288,60 @@ def _load_known_error_classes() -> dict:
     return result
 
 
+def _build_webshare_proxy_config(
+    username: Optional[str],
+    password: Optional[str],
+):
+    """Return a ``WebshareProxyConfig`` when both creds are set.
+
+    Returns ``None`` when either credential is missing, or when the
+    installed ``youtube-transcript-api`` does not ship the proxy module
+    (the 0.6.x line). A ``None`` return means "no proxy, direct
+    connection" and callers should respect that.
+    """
+
+    if not username or not password:
+        return None
+    try:
+        # v1.x exposes proxy configs here.
+        from youtube_transcript_api.proxies import WebshareProxyConfig  # type: ignore
+    except Exception:  # pragma: no cover - old library or missing module
+        return None
+    try:
+        return WebshareProxyConfig(
+            proxy_username=username,
+            proxy_password=password,
+        )
+    except Exception:  # pragma: no cover - guard against API drift
+        return None
+
+
+def _instantiate_api(api_class, proxy_config):
+    """Instantiate the API, passing ``proxy_config`` when the library
+    accepts it. Falls back to a bare constructor for older builds."""
+
+    if proxy_config is not None:
+        try:
+            return api_class(proxy_config=proxy_config)
+        except TypeError:
+            # Library too old to accept ``proxy_config``. Fall through to
+            # the bare constructor so the caller still gets a working
+            # (unproxied) API instance rather than a hard crash.
+            pass
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        return api_class()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _get_transcript_entries(
     api_class,
     video_id: str,
     preferred_languages: list[str],
+    *,
+    proxy_config=None,
 ):
     """Version-agnostic adapter returning ``(entries, language_code)``."""
 
@@ -282,10 +349,7 @@ def _get_transcript_entries(
     # Some 1.x builds still have to be instantiated before ``fetch``/``list``
     # work; others expose them as methods on the class object directly. Try
     # an instance first — this is the common 1.x shape.
-    try:
-        instance = api_class()
-    except Exception:  # pragma: no cover - defensive
-        instance = None
+    instance = _instantiate_api(api_class, proxy_config)
 
     if instance is not None and (
         hasattr(instance, "fetch") or hasattr(instance, "list")
