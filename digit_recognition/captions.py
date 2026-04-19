@@ -26,7 +26,23 @@ class CaptionsError(RuntimeError):
 
 
 class CaptionsUnavailableError(CaptionsError):
-    """Raised when the video has no retrievable captions at all."""
+    """Raised when the video genuinely has no captions track to fetch.
+
+    This means YouTube replied normally and told us the video either has
+    no captions, has captions disabled, or has none in the requested
+    language. It does NOT cover blocking / network / bot-detection cases.
+    """
+
+
+class CaptionsBlockedError(CaptionsError):
+    """Raised when YouTube refused to give us the captions for this request.
+
+    Typical causes: the host IP is being bot-checked (very common on
+    Streamlit Community Cloud and other datacenter networks), YouTube
+    requires a PO token, the video is age-restricted, or the captions
+    endpoint is temporarily rate-limited. Captions may very well exist;
+    we just couldn't reach them from here.
+    """
 
 
 class InvalidYouTubeUrlError(CaptionsError):
@@ -103,34 +119,88 @@ def fetch_youtube_captions(
         entries, chosen_language = _get_transcript_entries(
             YouTubeTranscriptApi, video_id, preferred_languages
         )
+    # ------------------------------------------------------------------
+    # "Captions truly do not exist" — keep these as CaptionsUnavailable.
+    # ------------------------------------------------------------------
     except known_errors["TranscriptsDisabled"] as exc:
         raise CaptionsUnavailableError(
             "Captions are disabled on this video."
         ) from exc
     except known_errors["NoTranscriptFound"] as exc:
         raise CaptionsUnavailableError(
-            "No captions are available for this video."
+            "No captions are available for this video in the requested "
+            "language."
         ) from exc
     except known_errors["VideoUnavailable"] as exc:
         raise CaptionsUnavailableError(
             "YouTube reports this video as unavailable."
+        ) from exc
+    except known_errors["VideoUnplayable"] as exc:
+        raise CaptionsUnavailableError(
+            "YouTube reports this video as unplayable from this region."
+        ) from exc
+    # ------------------------------------------------------------------
+    # "YouTube blocked this request" — captions may exist; we can't
+    # reach them from this host. Surface a different error so the UI
+    # can suggest a different path (e.g. video upload).
+    # ------------------------------------------------------------------
+    except known_errors["IpBlocked"] as exc:
+        raise CaptionsBlockedError(
+            "YouTube is blocking requests from this server's IP. This is "
+            "common on Streamlit Community Cloud and other datacenter "
+            "networks. Captions may exist for this video; the host just "
+            "cannot retrieve them. Try the Video file tab, run the app "
+            "locally, or use a different network."
+        ) from exc
+    except known_errors["RequestBlocked"] as exc:
+        raise CaptionsBlockedError(
+            "YouTube refused this request (bot check). Captions may exist "
+            "for this video; the host cannot retrieve them right now. Try "
+            "the Video file tab or run the app locally."
+        ) from exc
+    except known_errors["PoTokenRequired"] as exc:
+        raise CaptionsBlockedError(
+            "YouTube is requiring a proof-of-origin token (PO token) for "
+            "this video. The captions endpoint cannot be reached without "
+            "it. Try a different video, or use the Video file tab."
+        ) from exc
+    except known_errors["AgeRestricted"] as exc:
+        raise CaptionsBlockedError(
+            "This video is age-restricted; captions cannot be fetched "
+            "without sign-in."
+        ) from exc
+    except known_errors["YouTubeRequestFailed"] as exc:
+        raise CaptionsBlockedError(
+            "Could not reach YouTube to fetch captions (network error). "
+            f"Details: {str(exc)[:200]}"
+        ) from exc
+    except known_errors["CouldNotRetrieveTranscript"] as exc:
+        # Catch-all for the library's own retrieval failure base class.
+        # If we got here it's NOT one of the specific subclasses above —
+        # so it's most likely a transient or unknown YouTube response,
+        # not a legitimate "no captions" answer.
+        raise CaptionsBlockedError(
+            "YouTube would not return captions for this request. This is "
+            "usually a temporary block. Try again, switch network, or use "
+            f"the Video file tab. Details: {str(exc)[:200]}"
         ) from exc
     except CaptionsError:
         raise
     except Exception as exc:  # pragma: no cover - defensive / network
         message = str(exc).strip() or exc.__class__.__name__
         lowered = message.lower()
+        # ONLY classify as "unavailable" when the library itself said so
+        # in plain English. Otherwise treat as a blocking error so we
+        # don't lie to the user about whether captions exist.
         if (
-            "could not retrieve" in lowered
-            or "no element found" in lowered
-            or "transcripts are disabled" in lowered
+            "transcripts are disabled" in lowered
             or "no transcripts were found" in lowered
         ):
             raise CaptionsUnavailableError(
                 "YouTube returned no captions for this video."
             ) from exc
-        raise CaptionsError(
-            f"Captions fetch failed. Details: {message}"
+        raise CaptionsBlockedError(
+            f"Captions fetch failed. Details: {message[:300]}"
         ) from exc
 
     segments = _entries_to_segments(entries)
@@ -164,7 +234,21 @@ def _load_known_error_classes() -> dict:
     """
 
     result: dict = {}
-    for name in ("TranscriptsDisabled", "NoTranscriptFound", "VideoUnavailable"):
+    error_names = (
+        # Genuine "no captions" cases.
+        "TranscriptsDisabled",
+        "NoTranscriptFound",
+        "VideoUnavailable",
+        "VideoUnplayable",
+        # Blocking / network cases (only present in v1.x).
+        "IpBlocked",
+        "RequestBlocked",
+        "PoTokenRequired",
+        "AgeRestricted",
+        "YouTubeRequestFailed",
+        "CouldNotRetrieveTranscript",
+    )
+    for name in error_names:
         cls = None
         for module_path in (
             "youtube_transcript_api._errors",
@@ -319,6 +403,7 @@ def _entries_to_segments(
 __all__ = [
     "CaptionsError",
     "CaptionsUnavailableError",
+    "CaptionsBlockedError",
     "InvalidYouTubeUrlError",
     "extract_video_id",
     "fetch_youtube_captions",

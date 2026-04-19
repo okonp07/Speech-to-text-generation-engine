@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from digit_recognition.captions import (
+    CaptionsBlockedError,
     CaptionsError,
     CaptionsUnavailableError,
     InvalidYouTubeUrlError,
@@ -1376,6 +1377,21 @@ def _render_app_page() -> None:
                         "**Video file** tab and upload the clip so the app can run "
                         "Whisper on it locally."
                     )
+                except CaptionsBlockedError as exc:
+                    # YouTube is refusing to return captions to this host
+                    # (common on Streamlit Community Cloud). Captions may
+                    # very well exist on the video — we just can't fetch
+                    # them from this IP. Tell the user honestly rather
+                    # than pretending the video has no captions.
+                    st.warning(
+                        "YouTube is temporarily blocking caption requests from this "
+                        "server. The video may still have captions — this host just "
+                        "cannot reach them. Try again in a minute, switch to the "
+                        "**Video file** tab and upload the clip, or run the app "
+                        "locally where YouTube usually allows the request."
+                    )
+                    with st.expander("Technical details"):
+                        st.caption(str(exc))
                 except CaptionsError as exc:
                     st.error(str(exc))
 
