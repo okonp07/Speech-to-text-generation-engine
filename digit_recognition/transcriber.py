@@ -193,6 +193,7 @@ class SpeechTranscriber:
         language: str | None = None,
         vad_filter: bool = True,
         progress_callback: Optional[ProgressCallback] = None,
+        word_timestamps: bool = True,
     ) -> TranscriptionResult:
         """Transcribe a local audio file.
 
@@ -201,6 +202,11 @@ class SpeechTranscriber:
         total_audio_seconds)``. ``total_audio_seconds`` may be ``None``
         if the model couldn't determine it (rare). Callbacks let the
         UI render a live progress bar without any polling.
+
+        ``word_timestamps`` defaults to ``True`` for fine-grained
+        confidence scoring. Set to ``False`` on long inputs to halve
+        the per-segment memory overhead — useful on Streamlit
+        Community Cloud's 1 GB ceiling.
         """
 
         model = self._load_model()
@@ -208,7 +214,7 @@ class SpeechTranscriber:
             str(audio_path),
             beam_size=self.beam_size,
             vad_filter=vad_filter,
-            word_timestamps=True,
+            word_timestamps=word_timestamps,
             language=language,
         )
 

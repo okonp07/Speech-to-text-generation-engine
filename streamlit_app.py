@@ -869,7 +869,17 @@ def _render_feedback_page() -> None:
 # version becomes part of the cache key, so Streamlit's cache_resource
 # can't hand back a pre-change instance after a hot-reload — which
 # otherwise causes AttributeError / TypeError on new kwargs.
-_TRANSCRIBER_CACHE_VERSION = "2-progress-callback"
+_TRANSCRIBER_CACHE_VERSION = "3-word-ts-optional"
+
+# Any audio file above this size is treated as "long". We skip the
+# waveform plot and quality-check panel for long audio so we don't
+# decode a ~1 GB NumPy array alongside faster-whisper's own buffers —
+# this is what was OOM-killing the process on 1-hour clips under
+# Streamlit Community Cloud's 1 GB memory ceiling.
+#
+# Rough sizing: 40 MB covers ~21 min of 16 kHz mono WAV,
+# or ~40-45 min of 128 kbps MP3 / M4A.
+_LONG_AUDIO_BYTES = 40 * 1024 * 1024
 
 
 @st.cache_resource
@@ -927,23 +937,62 @@ def _transcribe_local_path(
     Used by the YouTube URL and video file tabs, where ingestion produces a
     local path we want to keep alive across reruns (cached in session
     state) rather than deleting straight away.
+
+    Memory budget: on Streamlit Community Cloud we have ~1 GB of RAM
+    for the whole app. For audio above :data:`_LONG_AUDIO_BYTES` we
+    drop the (heavy) second librosa load and disable word-level
+    timestamps so the process doesn't OOM-kill itself on long clips.
     """
 
+    import gc
+
     try:
-        result = transcriber.transcribe_file(
-            audio_path, language=language, progress_callback=progress_callback
-        )
+        size = audio_path.stat().st_size
+    except OSError:
+        size = 0
+    is_long_audio = size > _LONG_AUDIO_BYTES
+
+    # Build the transcribe_file call. Long audio drops word_timestamps
+    # to roughly halve the per-segment data held in RAM.
+    transcribe_kwargs = {
+        "language": language,
+        "progress_callback": progress_callback,
+        "word_timestamps": not is_long_audio,
+    }
+
+    try:
+        result = transcriber.transcribe_file(audio_path, **transcribe_kwargs)
     except TypeError as exc:
         # Defensive: Streamlit's cache_resource can hold a stale
-        # transcriber from before progress_callback existed. Retry
-        # without the kwarg so the user still gets a transcript —
-        # just without the live progress bar. The user can recover
-        # the bar by rebooting the app from Manage app.
-        if "progress_callback" not in str(exc):
-            raise
-        result = transcriber.transcribe_file(audio_path, language=language)
-    audio = transcriber.processor.load_audio(audio_path)
-    report = transcriber.processor.quality_report(audio)
+        # transcriber from before progress_callback / word_timestamps
+        # existed. Strip unknown kwargs and retry so the user still
+        # gets a transcript — just without the live progress bar or
+        # the memory optimization. The fresh kwargs become available
+        # again after the app is rebooted.
+        message = str(exc)
+        for dropped in ("word_timestamps", "progress_callback"):
+            if dropped in message:
+                transcribe_kwargs.pop(dropped, None)
+        result = transcriber.transcribe_file(audio_path, **transcribe_kwargs)
+
+    if is_long_audio:
+        # Skip the waveform/quality panel for long audio — the
+        # ~230 MB float32 copy would push us over the memory ceiling.
+        audio = None
+        report = None
+        st.caption(
+            "ⓘ Audio is long — skipped the waveform and quality panel "
+            "to keep memory use low on Streamlit Community Cloud. "
+            "The transcript itself is complete."
+        )
+    else:
+        audio = transcriber.processor.load_audio(audio_path)
+        report = transcriber.processor.quality_report(audio)
+
+    # Help the interpreter release intermediate buffers held by
+    # faster-whisper before the results panel renders.
+    gc.collect()
+
     return audio, result, report
 
 
