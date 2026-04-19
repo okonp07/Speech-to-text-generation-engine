@@ -14,6 +14,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from digit_recognition.captions import (
+    CaptionsError,
+    CaptionsUnavailableError,
+    InvalidYouTubeUrlError,
+    fetch_youtube_captions,
+)
 from digit_recognition.exports import build_json, build_srt, build_txt, build_vtt
 from digit_recognition.media_ingest import (
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -989,13 +995,21 @@ def _render_about_page() -> None:
 
 
 def _render_results_panel(
-    audio: np.ndarray,
+    audio: np.ndarray | None,
     result: "TranscriptionResult",
     report,
     display_name: str,
-    transcriber: "SpeechTranscriber",
+    transcriber: "SpeechTranscriber" | None,
+    *,
+    source_label: str = "audio",
 ) -> None:
-    """Shared rendering used by every input source."""
+    """Shared rendering used by every input source.
+
+    ``audio`` / ``report`` / ``transcriber`` are optional so the captions
+    path (which has no audio signal to show) can reuse the same panel. When
+    any of the three is ``None``, the waveform and quality-checks sections
+    are suppressed.
+    """
 
     st.markdown(
         """
@@ -1046,30 +1060,36 @@ def _render_results_panel(
             hide_index=True,
         )
 
-    viz_col, qa_col = st.columns([1.5, 1])
-    with viz_col:
-        _section_intro(
-            "Signal view",
-            (
-                "The waveform and mel spectrogram help you see whether the recording is clear, "
-                "clipped, or dominated by silence."
-            ),
-        )
-        st.pyplot(_plot_audio(audio, transcriber.processor.sample_rate))
+    if audio is not None and report is not None and transcriber is not None:
+        viz_col, qa_col = st.columns([1.5, 1])
+        with viz_col:
+            _section_intro(
+                "Signal view",
+                (
+                    "The waveform and mel spectrogram help you see whether the recording is clear, "
+                    "clipped, or dominated by silence."
+                ),
+            )
+            st.pyplot(_plot_audio(audio, transcriber.processor.sample_rate))
 
-    with qa_col:
-        _section_intro(
-            "Quality checks",
-            "These quick diagnostics flag common recording issues that can reduce prediction quality.",
-            anchor_id="quality-checks-section",
-        )
-        st.write(
-            {
-                "duration_seconds": round(report.duration_seconds, 3),
-                "peak_amplitude": round(report.peak_amplitude, 4),
-                "rms_amplitude": round(report.rms_amplitude, 4),
-                "issues": list(report.issues) or ["No obvious issues detected."],
-            }
+        with qa_col:
+            _section_intro(
+                "Quality checks",
+                "These quick diagnostics flag common recording issues that can reduce prediction quality.",
+                anchor_id="quality-checks-section",
+            )
+            st.write(
+                {
+                    "duration_seconds": round(report.duration_seconds, 3),
+                    "peak_amplitude": round(report.peak_amplitude, 4),
+                    "rms_amplitude": round(report.rms_amplitude, 4),
+                    "issues": list(report.issues) or ["No obvious issues detected."],
+                }
+            )
+    else:
+        st.caption(
+            f"Signal view and quality checks are skipped for {source_label}-based "
+            "transcripts \u2014 there is no raw audio to analyse."
         )
 
     st.session_state.history.append(
@@ -1174,11 +1194,11 @@ def _render_app_page() -> None:
         language = None if language_label == "Auto detect" else "en"
         st.markdown("Supported audio: WAV, MP3, M4A, FLAC, OGG")
         st.markdown("Supported video: MP4, MOV, MKV, WEBM, AVI, M4V")
-        st.markdown("YouTube: paste any public watch / shorts / youtu.be link")
+        st.markdown("YouTube: any public watch / shorts / youtu.be link with captions")
         st.markdown("---")
-        st.caption("The first run may take longer while the speech model downloads.")
+        st.caption("The first Whisper run may take longer while the model downloads.")
         st.caption("Best results come from clear speech and low background noise.")
-        st.caption("YouTube + video flows require ffmpeg on the host.")
+        st.caption("The video tab needs ffmpeg on the host. YouTube does not.")
 
     _section_intro(
         "Input",
@@ -1312,8 +1332,8 @@ def _render_app_page() -> None:
     # --- YouTube URL tab -----------------------------------------------------
     with youtube_tab:
         st.caption(
-            "Paste a YouTube link (watch, shorts, or youtu.be). The app uses yt-dlp to pull "
-            "the audio, then transcribes it exactly like any other source."
+            "Paste a YouTube link (watch, shorts, or youtu.be). The app pulls the video's "
+            "caption track directly — no audio download, no sign-in, no wait."
         )
         youtube_url = st.text_input(
             "YouTube URL",
@@ -1323,44 +1343,10 @@ def _render_app_page() -> None:
         )
         st.session_state.youtube_url_value = youtube_url
 
-        with st.expander(
-            "Bot-check workaround: upload a YouTube cookies.txt",
-            expanded=False,
-        ):
-            st.markdown(
-                "On hosted deployments (Streamlit Community Cloud, Render, Fly.io, "
-                "etc.) YouTube frequently demands a signed-in cookie before it will "
-                "serve audio — the error looks like *“Sign in to confirm you're not "
-                "a bot”*. Upload a `cookies.txt` exported from your browser to bypass it."
-            )
-            st.markdown(
-                "**How to get `cookies.txt`:** install the "
-                "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
-                "Chrome extension, open [youtube.com](https://www.youtube.com) while "
-                "signed in, click the extension, and save the file. **Use a throwaway "
-                "Google account** — anyone with this file can use your YouTube session."
-            )
-            uploaded_cookies = st.file_uploader(
-                "cookies.txt",
-                type=["txt"],
-                key="youtube-cookies",
-                help="Netscape-format cookies exported from your browser while signed into YouTube.",
-            )
-            if uploaded_cookies is not None:
-                st.session_state["youtube_cookies_bytes"] = uploaded_cookies.getvalue()
-                st.success("Cookies loaded for this session.")
-            elif "youtube_cookies_bytes" in st.session_state:
-                st.caption("Cookies from an earlier upload are still active in this session.")
-            if st.session_state.get("youtube_cookies_bytes") and st.button(
-                "Clear stored cookies", key="clear-youtube-cookies"
-            ):
-                st.session_state.pop("youtube_cookies_bytes", None)
-                st.rerun()
-
         col_go_yt, col_clear_yt = st.columns([1, 1])
         with col_go_yt:
             run_youtube = st.button(
-                "Download and transcribe",
+                "Fetch transcript",
                 key="run-youtube",
                 type="primary",
                 disabled=not youtube_url.strip(),
@@ -1375,53 +1361,35 @@ def _render_app_page() -> None:
         url_key = youtube_url.strip()
         cached_yt = st.session_state.youtube_cache.get(url_key)
 
-        if run_youtube and url_key:
-            if not is_valid_youtube_url(url_key):
-                st.error(
-                    "That does not look like a YouTube URL. Paste a link that starts "
-                    "with https://www.youtube.com/ or https://youtu.be/."
-                )
-            elif cached_yt is None:
-                with st.spinner("Downloading audio from YouTube…"):
-                    cookies_bytes = st.session_state.get("youtube_cookies_bytes")
-                    cookie_tmp: Path | None = None
-                    try:
-                        if cookies_bytes:
-                            cookie_tmp = Path(
-                                tempfile.NamedTemporaryFile(
-                                    delete=False, suffix=".txt"
-                                ).name
-                            )
-                            cookie_tmp.write_bytes(cookies_bytes)
-                        ingested = fetch_youtube_audio(
-                            url_key,
-                            cookiefile=cookie_tmp,
-                        )
-                        st.session_state.youtube_cache[url_key] = (
-                            ingested.audio_path,
-                            ingested.display_name,
-                        )
-                        cached_yt = st.session_state.youtube_cache[url_key]
-                    except MediaIngestError as exc:
-                        st.error(str(exc))
-                        cached_yt = None
-                    finally:
-                        if cookie_tmp is not None:
-                            cookie_tmp.unlink(missing_ok=True)
+        if run_youtube and url_key and cached_yt is None:
+            with st.spinner("Fetching captions from YouTube…"):
+                try:
+                    result = fetch_youtube_captions(url_key, language_hint=language)
+                    st.session_state.youtube_cache[url_key] = result
+                    cached_yt = result
+                except InvalidYouTubeUrlError as exc:
+                    st.error(str(exc))
+                except CaptionsUnavailableError:
+                    st.warning(
+                        "This video does not have captions available, so we cannot "
+                        "transcribe it directly. Try a different URL, or switch to the "
+                        "**Video file** tab and upload the clip so the app can run "
+                        "Whisper on it locally."
+                    )
+                except CaptionsError as exc:
+                    st.error(str(exc))
 
         if cached_yt is not None:
-            audio_path, display_name = cached_yt
-            st.audio(str(audio_path))
-            _run_and_render(
-                source_kind="YouTube URL",
-                audio_source=None,
-                audio_path=audio_path,
-                display_name=display_name,
-                model_size=model_size,
-                language=language,
+            _render_results_panel(
+                audio=None,
+                result=cached_yt,
+                report=None,
+                display_name=f"youtube_{url_key.split('/')[-1][:15] or 'video'}",
+                transcriber=None,
+                source_label="caption",
             )
         elif not run_youtube:
-            st.info("Paste a YouTube URL, then click “Download and transcribe”.")
+            st.info("Paste a YouTube URL, then click “Fetch transcript”.")
 
 
 def main() -> None:
